@@ -1,6 +1,3 @@
-# Copyright (c) 2025 Your Name
-# All rights reserved.
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader

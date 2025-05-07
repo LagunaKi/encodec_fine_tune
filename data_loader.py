@@ -1,6 +1,3 @@
-# Copyright (c) 2025 Your Name
-# All rights reserved.
-
 import torch
 import torchaudio
 import pandas as pd

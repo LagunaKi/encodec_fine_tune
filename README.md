@@ -71,9 +71,15 @@ fine_tune/
 └── README.md           # 项目文档
 ```
 
-## 数据流说明
+## 数据流与输出说明
 
-1. **数据准备阶段**：
+### 模型输出特性
+1. 输出类型：连续值(浮点数)
+2. 输出范围：与训练标签中的complexity分数范围一致
+3. 与标签对应：直接预测labels.csv中的complexity字段值
+4. 输出解释：数值越大表示旋律复杂度越高
+
+### 数据处理流程
    - 从`labels.csv`读取已验证的音频文件信息
    - 加载对应的MP3音频文件
    - 根据boundary字段分割音频片段
@@ -121,7 +127,8 @@ class EncodecComplexityModel(nn.Module):
         # 1. 逐步降维避免信息损失
         # 2. ReLU激活引入非线性
         # 3. Dropout层增强泛化能力
-        # 4. 最终输出为连续值，无激活函数
+        # 4. 最终输出为连续值(无激活函数)，直接对应标签中的complexity分数
+        # 5. 输出范围与训练标签范围一致(需根据labels.csv中的complexity范围确定)
 ```
 
 ### 2. 训练流程
@@ -163,9 +170,9 @@ complexity = predict_audio_complexity(model, "audio.mp3")
 plot_complexity("audio.mp3", complexity, "output.png")
 ```
 
-## 使用示例
+## 使用指南
 
-### 训练模型
+### 本地训练
 ```bash
 python -m fine_tune.train \
   --batch_size 8 \
@@ -175,17 +182,60 @@ python -m fine_tune.train \
   --save_dir checkpoints
 ```
 
+### 远程GPU服务器训练指南
+
+1. **连接服务器**
+```bash
+ssh fd-lamt-04@10.177.64.182
+# 输入密码后登录
+```
+
+2. **环境配置**
+```bash
+# 1. 安装Miniconda
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh
+
+# 2. 创建环境
+conda create -n encodec python=3.9
+conda activate encodec
+
+# 3. 安装依赖
+pip install -r requirements.txt
+```
+
+3. **传输代码**
+```bash
+# 从本地传输代码到服务器
+scp -r fine_tune fd-lamt-04@10.177.64.182:~/lamt/
+```
+
+4. **启动训练**
+```bash
+cd ~/lamt
+conda activate encodec
+python -m fine_tune.train \
+  --batch_size 16 \  # 可增大batch size利用GPU显存
+  --epochs 50 \
+  --lr 1e-4 \
+  --device cuda \
+  --save_dir checkpoints
+```
+
+5. **获取训练结果**
+```bash
+# 将模型从服务器下载到本地
+scp fd-lamt-04@10.177.64.182:~/lamt/checkpoints/best_model.pth ./
+```
+
+### 注意事项
+1. 使用tmux或screen保持会话
+2. 监控GPU使用情况：`nvidia-smi -l 1`
+3. 调整batch_size充分利用GPU显存
+
 ### 预测复杂度
 ```bash
 python -m fine_tune.predict sample.mp3 \
   --model_path checkpoints/best_model.pth \
   --save_plot result.png
 ```
-
-## 后续改进方向
-
-1. 增加更多评估指标
-2. 实现早停机制
-3. 添加模型解释性分析
-4. 支持批量预测
-5. 部署为Web服务
