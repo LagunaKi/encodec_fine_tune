@@ -170,19 +170,18 @@ complexity = predict_audio_complexity(model, "audio.mp3")
 plot_complexity("audio.mp3", complexity, "output.png")
 ```
 
-## 使用指南
+## 训练指南
 
-### 本地训练
-```bash
-python -m fine_tune.train \
-  --batch_size 8 \
-  --epochs 50 \
-  --lr 1e-4 \
-  --device cuda \
-  --save_dir checkpoints
-```
+### 1. 分布式训练说明
+- 支持单卡和多卡(DDP)训练
+- 自动设备分配
+- 梯度同步
+- 线性加速比
 
-### 远程GPU服务器训练指南
+### 2. 训练命令
+
+
+### 3. 远程GPU服务器训练指南
 
 1. **连接服务器**
 ```bash
@@ -214,12 +213,7 @@ scp -r fine_tune fd-lamt-04@10.177.64.182:~/lamt/
 ```bash
 cd ~/lamt
 conda activate encodec
-python -m fine_tune.train \
-  --batch_size 16 \  # 可增大batch size利用GPU显存
-  --epochs 50 \
-  --lr 1e-4 \
-  --device cuda \
-  --save_dir checkpoints
+torchrun --nproc_per_node=2 fine_tune/train.py --batch_size 8 --epochs 50 --lr 2e-4 --save_dir ddp_checkpoints --gradient_accumulation 2
 ```
 
 5. **获取训练结果**

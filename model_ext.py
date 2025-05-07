@@ -36,11 +36,12 @@ class EncodecComplexityModel(nn.Module):
             nn.Linear(hidden_dim, 1)  # Predict single complexity score
         )
         
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with complexity prediction.
         
         Args:
             x: Input audio tensor of shape (batch, 1, samples)
+            mask: Attention mask (batch, 1, samples) where 1=valid, 0=padding
             
         Returns:
             tuple: (audio_output, complexity)
@@ -53,10 +54,23 @@ class EncodecComplexityModel(nn.Module):
         
         # Get encoder's latent representation (before quantization)
         with torch.no_grad():
-            emb = self.encodec.quantizer.decode(codes.transpose(0, 1))
+            emb = self.encodec.quantizer.decode(codes.transpose(0, 1))  # shape: [batch, channels, time]
         
-        # Average over time dimension
-        emb = emb.mean(dim=2)  # shape: [batch, channels]
+        # Handle masked averaging
+        if mask is not None:
+            # Downsample mask to match feature dimension
+            mask = torch.nn.functional.interpolate(
+                mask.float(), 
+                size=emb.size(2), 
+                mode='nearest')
+            mask = mask.squeeze(1)  # shape: [batch, time]
+            
+            # Apply mask and compute mean
+            masked_emb = emb * mask.unsqueeze(1)  # shape: [batch, channels, time]
+            emb = masked_emb.sum(dim=2) / (mask.sum(dim=1, keepdim=True) + 1e-6)
+        else:
+            # Simple average if no mask provided
+            emb = emb.mean(dim=2)
         
         # Predict complexity
         complexity = self.complexity_head(emb)
@@ -66,11 +80,12 @@ class EncodecComplexityModel(nn.Module):
         
         return audio_output, complexity.squeeze(-1)
     
-    def predict_complexity(self, x: torch.Tensor) -> torch.Tensor:
+    def predict_complexity(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """Predict complexity score without decoding audio.
         
         Args:
             x: Input audio tensor of shape (batch, 1, samples)
+            mask: Attention mask (batch, 1, samples) where 1=valid, 0=padding
             
         Returns:
             Predicted complexity scores
@@ -78,5 +93,18 @@ class EncodecComplexityModel(nn.Module):
         encoded_frames = self.encodec.encode(x)
         codes = encoded_frames[0][0]
         emb = self.encodec.quantizer.decode(codes.transpose(0, 1))
-        emb = emb.mean(dim=2)
+        
+        if mask is not None:
+            # Downsample mask to match feature dimension
+            mask = torch.nn.functional.interpolate(
+                mask.float(), 
+                size=emb.size(2), 
+                mode='nearest')
+            mask = mask.squeeze(1)
+            
+            # Apply mask and compute mean
+            masked_emb = emb * mask.unsqueeze(1)
+            emb = masked_emb.sum(dim=2) / (mask.sum(dim=1, keepdim=True) + 1e-6)
+        else:
+            emb = emb.mean(dim=2)
         return self.complexity_head(emb).squeeze(-1)
