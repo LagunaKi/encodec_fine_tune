@@ -2,109 +2,95 @@ import torch
 import torch.nn as nn
 from encodec import EncodecModel
 from typing import Tuple
+import torch.nn.functional as F
 
-class EncodecComplexityModel(nn.Module):
-    """EnCodec model extended with complexity prediction head.
+class RelativeComplexityModel(nn.Module):
+    """EnCodec-based model for predicting relative complexity between variation segments.
     
     Args:
         pretrained: Whether to load pretrained EnCodec weights
         freeze_encoder: Whether to freeze encoder weights during training
-        hidden_dim: Dimension of hidden layers in prediction head
+        hidden_dim: Dimension of hidden layers
+        tcn_layers: Number of TCN layers
+        num_channels: Number of channels in TCN
     """
     def __init__(self, 
                  pretrained: bool = True,
                  freeze_encoder: bool = True,
-                 hidden_dim: int = 256):
+                 hidden_dim: int = 256,
+                 tcn_layers: int = 4,
+                 num_channels: int = 64):
         super().__init__()
         
         # Load pretrained EnCodec model
         self.encodec = EncodecModel.encodec_model_24khz(pretrained=pretrained)
-        self.encodec.set_target_bandwidth(6.0)  # Use 6kbps model
+        self.encodec.set_target_bandwidth(6.0)
         
-        # Freeze encoder weights if specified
+        # Freeze encoder if specified
         if freeze_encoder:
             for param in self.encodec.parameters():
                 param.requires_grad = False
-        
-        # Add complexity prediction head
-        encoder_out_dim = 128  # Dimension of encoder output
-        self.complexity_head = nn.Sequential(
-            nn.Linear(encoder_out_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)  # Predict single complexity score
+                
+        # TCN for temporal feature extraction
+        self.tcn = nn.Sequential(
+            *[nn.Sequential(
+                nn.Conv1d(128, num_channels, kernel_size=3, padding=1),
+                nn.BatchNorm1d(num_channels),
+                nn.ReLU()
+            ) for _ in range(tcn_layers)]
         )
         
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with complexity prediction.
+        # Cross-attention for variation comparison
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=num_channels,
+            num_heads=4,
+            batch_first=True
+        )
         
-        Args:
-            x: Input audio tensor of shape (batch, 1, samples)
-            mask: Attention mask (batch, 1, samples) where 1=valid, 0=padding
-            
-        Returns:
-            tuple: (audio_output, complexity)
-                  audio_output: Reconstructed audio
-                  complexity: Predicted complexity scores
-        """
-        # Get encoder output
-        encoded_frames = self.encodec.encode(x)
-        codes = encoded_frames[0][0]  # Get first (and only) frame's codes
+        # Complexity prediction head (original version)
+        self.complexity_head = nn.Sequential(
+            nn.Linear(num_channels * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
         
-        # Get encoder's latent representation (before quantization)
-        with torch.no_grad():
-            emb = self.encodec.quantizer.decode(codes.transpose(0, 1))  # shape: [batch, channels, time]
-        
-        # Handle masked averaging
-        if mask is not None:
-            # Downsample mask to match feature dimension
-            mask = torch.nn.functional.interpolate(
-                mask.float(), 
-                size=emb.size(2), 
-                mode='nearest')
-            mask = mask.squeeze(1)  # shape: [batch, time]
-            
-            # Apply mask and compute mean
-            masked_emb = emb * mask.unsqueeze(1)  # shape: [batch, channels, time]
-            emb = masked_emb.sum(dim=2) / (mask.sum(dim=1, keepdim=True) + 1e-6)
-        else:
-            # Simple average if no mask provided
-            emb = emb.mean(dim=2)
-        
-        # Predict complexity
-        complexity = self.complexity_head(emb)
-        
-        # Get reconstructed audio
-        audio_output = self.encodec.decode(encoded_frames)
-        
-        return audio_output, complexity.squeeze(-1)
-    
-    def predict_complexity(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        """Predict complexity score without decoding audio.
-        
-        Args:
-            x: Input audio tensor of shape (batch, 1, samples)
-            mask: Attention mask (batch, 1, samples) where 1=valid, 0=padding
-            
-        Returns:
-            Predicted complexity scores
-        """
-        encoded_frames = self.encodec.encode(x)
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract temporal features using EnCodec and TCN."""
+        encoded_frames = self.encodec.encode(x) # discrete encode
         codes = encoded_frames[0][0]
-        emb = self.encodec.quantizer.decode(codes.transpose(0, 1))
+        emb = self.encodec.quantizer.decode(codes.transpose(0, 1)) # Dimension reduction, (B, C, T) → (B, T)
+        return self.tcn(emb.mean(dim=2).transpose(1, 2)).transpose(1, 2)
         
-        if mask is not None:
-            # Downsample mask to match feature dimension
-            mask = torch.nn.functional.interpolate(
-                mask.float(), 
-                size=emb.size(2), 
-                mode='nearest')
-            mask = mask.squeeze(1)
+    def forward(self, 
+               prev_segment: torch.Tensor, 
+               current_segment: torch.Tensor,
+               masks: torch.Tensor = None) -> torch.Tensor:
+        """Predict relative complexity between variation segments.
+        
+        Args:
+            prev_segment: Previous variation segment (B, 1, T1)
+            current_segment: Current variation segment (B, 1, T2)
+            masks: Optional attention masks (B, 2, max(T1,T2))
             
-            # Apply mask and compute mean
-            masked_emb = emb * mask.unsqueeze(1)
-            emb = masked_emb.sum(dim=2) / (mask.sum(dim=1, keepdim=True) + 1e-6)
-        else:
-            emb = emb.mean(dim=2)
-        return self.complexity_head(emb).squeeze(-1)
+        Returns:
+            Predicted complexity delta (B, 1)
+        """
+        # Extract features
+        prev_feat = self.extract_features(prev_segment)  # (B, T1, C)
+        curr_feat = self.extract_features(current_segment)  # (B, T2, C)
+        
+        # Cross-attention comparison
+        attn_out, _ = self.cross_attn(
+            query=curr_feat,
+            key=prev_feat,
+            value=prev_feat
+        )
+        
+        # Pool features
+        prev_pool = prev_feat.mean(dim=1)  # (B, C)
+        curr_pool = curr_feat.mean(dim=1)  # (B, C)
+        attn_pool = attn_out.mean(dim=1)  # (B, C)
+        
+        # Predict delta
+        features = torch.cat([curr_pool - prev_pool, attn_pool], dim=1)
+        return self.complexity_head(features)

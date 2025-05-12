@@ -2,126 +2,153 @@ import torch
 import torchaudio
 import pandas as pd
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 import numpy as np
+import json
 
-class ComplexityDataset:
-    """Dataset for audio complexity prediction with EnCodec.
+class SegmentPairDataset:
+    """Dataset for relative complexity prediction between adjacent segments.
     
     Args:
         audio_dir: Path to directory containing audio files
         labels_csv: Path to CSV file containing complexity labels
         sample_rate: Target sample rate for audio
         device: Device to load data to (cpu/cuda)
+        context_ratio: Ratio of previous segment to include as context
     """
     def __init__(self, 
-                 audio_dir: str = "dataset/verified_mp3",
-                 labels_csv: str = "dataset/labels.csv",
-                 sample_rate: int = 24000,
-                 device: str = "cuda"):
+                audio_dir: str = "dataset/verified_mp3",
+                labels_csv: str = "dataset/labels.csv",
+                sample_rate: int = 24000,
+                device: str = "cuda",
+                context_ratio: float = 1.0):
         self.audio_dir = Path(audio_dir)
         self.sample_rate = sample_rate
         self.device = device
+        self.context_ratio = context_ratio
         
-        # Load and filter labels
+        # Load labels
         self.labels_df = pd.read_csv(labels_csv)
-        self.labels_df = self.labels_df[self.labels_df["状态"] == "确定链接正确"]
         
-        # Build file list
-        self.audio_files = list(self.audio_dir.glob("*.mp3"))
+        # Verify audio files exist
+        audio_files = set(f.name for f in self.audio_dir.glob("*.mp3"))
+        self.labels_df = self.labels_df[
+            self.labels_df["name"].apply(lambda x: f"{x}.mp3" in audio_files)
+        ]
+        
+        # Parse segment boundaries and complexities
+        self.segments = self._parse_segments()
+        
+    def _parse_segments(self) -> List[Dict]:
+        """Parse audio segments from labels dataframe."""
+        segments = []
+        for _, row in self.labels_df.iterrows():
+            boundaries = json.loads(row["boundary"])
+            
+            # Handle empty or NaN complexity values
+            if pd.isna(row["complexity"]) or not row["complexity"].strip():
+                complexities = [0] * len(boundaries)  # Default zero complexity
+            else:
+                complexities = json.loads(row["complexity"])
+            
+            for i in range(1, len(boundaries)):
+                segments.append({
+                    "audio_file": row["name"] + ".mp3",
+                    "prev_start": boundaries[i-1],
+                    "current_start": boundaries[i],
+                    "prev_complexity": complexities[i-1],
+                    "current_complexity": complexities[i],
+                    "delta_complexity": complexities[i] - complexities[i-1]
+                })
+        return segments
         
     def __len__(self) -> int:
-        return len(self.audio_files)
-    
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load audio segment and corresponding complexity label.
+        return len(self.segments)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Load adjacent segment pair and complexity delta.
         
         Returns:
-            tuple: (audio_tensor, complexity_score)
-                  audio_tensor: shape (1, samples)
-                  complexity_score: shape (n_segments,)
+            tuple: (prev_segment, current_segment, delta_complexity)
+                  prev_segment: shape (1, samples)
+                  current_segment: shape (1, samples) 
+                  delta_complexity: scalar tensor
         """
-        # Load audio and convert to mono if needed
-        audio_path = self.audio_files[idx]
+        segment = self.segments[idx]
+        audio_path = self.audio_dir / segment["audio_file"]
+        
+        # Load full audio
         waveform, orig_sr = torchaudio.load(str(audio_path))
         
-        # Convert stereo to mono by averaging channels
-        if waveform.shape[0] > 1:  # Check if stereo (2 channels)
+        # Convert to mono and resample
+        if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
-            
-        # Resample if needed
         if orig_sr != self.sample_rate:
-            waveform = torchaudio.functional.resample(
-                waveform, orig_sr, self.sample_rate)
-            
-        # Get corresponding label data
-        file_id = audio_path.stem
-        label_row = self.labels_df[self.labels_df["name"] == file_id].iloc[0]
+            waveform = torchaudio.functional.resample(waveform, orig_sr, self.sample_rate)
         
-        # Convert boundary points to sample indices
-        boundaries = eval(label_row["boundary"])
-        boundaries = [int(t * self.sample_rate) for t in boundaries]
+        # Extract segments
+        prev_start = int(segment["prev_start"] * self.sample_rate)
+        current_start = int(segment["current_start"] * self.sample_rate)
         
-        # Get complexity scores
-        complexity_val = label_row["complexity"]
-        if pd.isna(complexity_val) or complexity_val == "":
-            complexity_val = "[5]"  # Default value if empty
-        if isinstance(complexity_val, str) and complexity_val.startswith("["):
-            complexity_val = eval(complexity_val)
-        complexity = torch.tensor(
-            complexity_val,
+        prev_segment = waveform[:, prev_start:current_start]
+        current_segment = waveform[:, current_start:]
+        
+        # Apply context ratio to previous segment
+        context_samples = int(prev_segment.shape[1] * self.context_ratio)
+        prev_segment = prev_segment[:, -context_samples:]
+        
+        # Prepare outputs
+        delta_complexity = torch.tensor(
+            segment["delta_complexity"],
             dtype=torch.float32,
             device=self.device)
         
-        # Move audio to device
-        waveform = waveform.to(self.device)
+        return prev_segment.to(self.device), current_segment.to(self.device), delta_complexity
         
-        return waveform, complexity
-    
     @staticmethod
-    def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Collate function for DataLoader with variable length audio and complexities.
+    def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Collate function for DataLoader with variable length segments.
         
         Args:
-            batch: List of (waveform, complexity) tuples
+            batch: List of (prev_segment, current_segment, delta_complexity) tuples
             
         Returns:
-            tuple: (waveforms, complexities, masks)
-                  waveforms: padded batch of audio tensors (B, 1, T)
-                  complexities: padded batch of complexity tensors (B, N)
-                  masks: attention mask for padded positions (B, 1, T)
+            tuple: (prev_segments, current_segments, deltas, masks)
+                  prev_segments: padded batch (B, 1, T1)
+                  current_segments: padded batch (B, 1, T2)
+                  deltas: batch of complexity deltas (B,)
+                  masks: attention masks for both segments (B, 2, max(T1,T2))
         """
-        waveforms, complexities = zip(*batch)
+        prev_segments, current_segments, deltas = zip(*batch)
         
         # Get max lengths
-        max_audio_len = max(w.shape[1] for w in waveforms)
-        max_complexity_len = max(c.shape[0] for c in complexities)
+        max_prev_len = max(p.shape[1] for p in prev_segments)
+        max_current_len = max(c.shape[1] for c in current_segments)
+        max_len = max(max_prev_len, max_current_len)
         
-        # Pad waveforms and create masks
-        padded_waveforms = []
+        # Pad segments and create masks
+        padded_prev = []
+        padded_current = []
         masks = []
-        for w in waveforms:
-            # Pad waveform
-            padding = max_audio_len - w.shape[1]
-            padded = torch.nn.functional.pad(w, (0, padding))
-            padded_waveforms.append(padded)
+        
+        for p, c in zip(prev_segments, current_segments):
+            # Pad segments
+            pad_prev = max_len - p.shape[1]
+            pad_current = max_len - c.shape[1]
             
-            # Create mask (1 for real, 0 for padded)
-            mask = torch.ones((1, w.shape[1]), dtype=torch.float32)
-            if padding > 0:
-                mask = torch.nn.functional.pad(mask, (0, padding))
+            padded_prev.append(torch.nn.functional.pad(p, (0, pad_prev)))
+            padded_current.append(torch.nn.functional.pad(c, (0, pad_current)))
+            
+            # Create combined mask (1=valid, 0=padding)
+            mask = torch.zeros((2, max_len), dtype=torch.float32)
+            mask[0, :p.shape[1]] = 1  # prev segment mask
+            mask[1, :c.shape[1]] = 1  # current segment mask
             masks.append(mask)
         
-        # Pad complexities
-        padded_complexities = []
-        for c in complexities:
-            padding = max_complexity_len - c.shape[0]
-            padded = torch.nn.functional.pad(c, (0, padding), value=0)  # Pad with 0
-            padded_complexities.append(padded)
-        
         # Stack tensors
-        waveforms = torch.stack(padded_waveforms)
-        complexities = torch.stack(padded_complexities)
+        prev_segments = torch.stack(padded_prev)
+        current_segments = torch.stack(padded_current)
+        deltas = torch.stack(deltas)
         masks = torch.stack(masks)
         
-        return waveforms, complexities, masks
+        return prev_segments, current_segments, deltas, masks
